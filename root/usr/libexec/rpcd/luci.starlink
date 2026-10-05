@@ -603,7 +603,13 @@ sqm_status() {
     sqm_installing && installing=true || installing=false
     err=""
     if [ "$installing" = "false" ] && [ -f "$SQM_INSTALL_LOG" ]; then
-        err=$(grep '^ERROR' "$SQM_INSTALL_LOG" | tail -1)
+        # Only surface an install error while something is still missing;
+        # once everything is installed the log is stale.
+        case "$base" in
+            *'"installed":true'*'"autorate_installed":true'*'"cake_available":true'*)
+                rm -f "$SQM_INSTALL_LOG" "$SQM_INSTALL_PID" ;;
+            *) err=$(grep '^ERROR' "$SQM_INSTALL_LOG" | tail -1) ;;
+        esac
     fi
     # splice extra fields into the helper's JSON object
     printf '%s,"available":true,"installing":%s,"install_error":"%s"}' \
