@@ -161,7 +161,9 @@ else
 fi
 
 # --- 5. Flow offloading ---
-if [ "$FIRST_RUN" = "1" ]; then
+if [ "$(uci -q get sqm.wan.enabled 2>/dev/null)" = "1" ]; then
+    echo "[5/7] Flow offloading — skipping (SQM/CAKE is enabled; offloading would bypass it)."
+elif [ "$FIRST_RUN" = "1" ]; then
     echo "[5/7] Enabling software flow offloading (disabling hardware offloading)..."
     uci set firewall.@defaults[0].flow_offloading='1'
     uci set firewall.@defaults[0].flow_offloading_hw='0'
@@ -198,14 +200,11 @@ fi
 
 # --- 7. Kernel optimisation ---
 # Always runs — package installs are idempotent and sysctl block is replaced in-place.
-echo "[7/7] Applying kernel optimisation (hybla, fq_codel, conntrack)..."
+echo "[7/7] Applying kernel optimisation (cubic, fq_codel, conntrack)..."
 
 # Install packages (try apk first for OpenWrt 25.x, fall back to opkg)
 if command -v apk >/dev/null 2>&1; then
-    echo "      Installing packages (kmod-tcp-hybla, tc-full, curl)..."
-    apk add kmod-tcp-hybla >/dev/null 2>&1 \
-        && echo "      kmod-tcp-hybla installed (apk)." \
-        || echo "      WARNING: kmod-tcp-hybla install failed."
+    echo "      Installing packages (tc-full, curl)..."
     apk add tc-full >/dev/null 2>&1 \
         && echo "      tc-full installed (apk)." \
         || echo "      WARNING: tc-full install failed."
@@ -214,10 +213,7 @@ if command -v apk >/dev/null 2>&1; then
         || echo "      WARNING: curl install failed."
 else
     opkg update >/dev/null 2>&1
-    echo "      Installing packages (kmod-tcp-hybla, tc, curl)..."
-    opkg install kmod-tcp-hybla >/dev/null 2>&1 \
-        && echo "      kmod-tcp-hybla installed (opkg)." \
-        || echo "      WARNING: kmod-tcp-hybla install failed."
+    echo "      Installing packages (tc, curl)..."
     opkg install tc >/dev/null 2>&1 \
         && echo "      tc installed (opkg)." \
         || true
@@ -239,35 +235,13 @@ if grep -q "# --- starlink-setup ---" /etc/sysctl.conf 2>/dev/null; then
     sed -i '/# --- starlink-setup ---/,/# --- \/starlink-setup ---/d' /etc/sysctl.conf
 fi
 
-# Pick best available congestion control: hybla > cdg > bbr > cubic
-# hybla: normalises CWND growth against a 25ms reference RTT so loss-based
-#        algorithms aren't penalised on links with elevated RTT. Originally
-#        designed for GEO satellites (~500ms RTT), but may still help on
-#        Starlink (LEO, ~20-50ms) where packet loss is higher than typical
-#        broadband. Only affects router-terminated TCP (e.g. WireGuard, local
-#        proxies), not LAN client traffic passing through NAT.
-# cdg:   delay-gradient; built-in on some kernels, not available on all OpenWrt targets
-# bbr:   bandwidth+RTT based; available as kmod-tcp-bbr
-AVAIL=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)
-if echo "$AVAIL" | grep -qw hybla; then
-    CC=hybla
-    echo "      Congestion control: hybla (RTT-normalising, loss-based)."
-elif echo "$AVAIL" | grep -qw cdg; then
-    CC=cdg
-    echo "      Congestion control: CDG (delay-gradient)."
-elif echo "$AVAIL" | grep -qw bbr; then
-    CC=bbr
-    echo "      Congestion control: BBR (hybla/CDG not available in this kernel build)."
-else
-    CC=cubic
-    echo "      Congestion control: cubic (fallback)."
-fi
+# Congestion control: cubic (kernel default). Only affects router-terminated TCP,
+# not LAN client traffic passing through NAT; SQM/CAKE handles queueing.
+CC=cubic
 
 cat >> /etc/sysctl.conf << EOF
 
 # --- starlink-setup ---
-# Congestion control: hybla preferred (RTT-normalising, loss-based).
-# Falls back to CDG, then BBR, depending on what this kernel build provides.
 net.core.default_qdisc = fq_codel
 net.ipv4.tcp_congestion_control = $CC
 net.ipv4.tcp_fastopen = 3

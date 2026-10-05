@@ -16,6 +16,7 @@ Works with Starlink Gen3 and higher dish
 - **Traffic** — WAN and LAN byte/packet counters
 - **Quality** — latency to 8.8.8.8 / 1.0.0.1, conntrack usage, router uptime
 - **DNS Servers** — IPv4 and IPv6 DNS server list with peerdns status; **DNS Mode selector** dropdown to switch between Default (Cloudflare + Google), Starlink (ISP DNS), Family Filter (Cloudflare for Families — blocks malware + adult content), and Malware Filter (Cloudflare malware-only)
+- **Traffic Shaping (SQM / CAKE)** — one-click install of `sqm-scripts`, CAKE and [cake-autorate](https://github.com/lynxthecat/cake-autorate); set max down/up rates and enable. cake-autorate adapts the shaper to Starlink's varying capacity. Flow offloading is switched off while SQM is enabled (it bypasses CAKE) and restored on disable.
 - **Configuration** — TCP congestion control, qdisc, flow offloading, MTU fix, DHCPv6-PD lifetime settings; **Turn Starlink Config On** and **Set as Default Home Page** buttons
 - **Router Stats** — CPU load gauges, memory usage bar, load averages; animated fan speed indicator with CPU temperature; **hardware flow offloading toggle** (detects NPU from board target)
 - **Connected Devices** — full-width scrollable device list with hostname, IP, MAC, active/stale state, DHCP range, and **per-device static IP assignment** (set or remove with one click)
@@ -40,7 +41,7 @@ The **Configuration** card includes a **Turn Starlink Config On** button that ap
 | **DNS** | Cloudflare (1.1.1.1 / 1.0.0.1) + Google (8.8.8.8 / 8.8.4.4), IPv4 and IPv6, peerdns disabled |
 | **NTP** | Adds Starlink dish (`192.168.100.1`) as GPS Stratum 1 source (~85–123µs accuracy) |
 | **Firewall** | Software flow offloading enabled, hardware offloading disabled (keeps fq_codel active), MSS clamping (`mtu_fix=1`) for both ingress and egress |
-| **TCP congestion control** | `hybla` (satellite-optimised, RTT-compensating) with automatic fallback to CDG → BBR → cubic |
+| **TCP congestion control** | `cubic` (kernel default; queueing is handled by SQM/CAKE) |
 | **Kernel / sysctl** | `fq_codel` default qdisc, `tcp_fastopen=3`, `tcp_mtu_probing=2`, `accept_ra=2` (required for IPv6 when forwarding=1), conntrack timeouts from official Starlink Gen2 firmware |
 
 ### Button states

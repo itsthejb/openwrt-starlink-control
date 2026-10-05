@@ -556,7 +556,10 @@ get_starlink_config_status() {
     [ "$ra_max" != "60"     ] && issues="${issues}ra_maxinterval,"
     [ "$ra_min" != "20"     ] && issues="${issues}ra_mininterval,"
     [ "$mtu_fix"  != "1"   ] && issues="${issues}mtu_fix,"
-    [ "$sw_off"   != "1"   ] && issues="${issues}flow_offloading,"
+    # With SQM enabled, offloading is intentionally off (it bypasses CAKE).
+    if [ "$(uci -q get sqm.wan.enabled 2>/dev/null)" != "1" ]; then
+        [ "$sw_off"   != "1"   ] && issues="${issues}flow_offloading,"
+    fi
     [ "$hw_off"   = "1"    ] && issues="${issues}flow_offloading_hw,"
     [ "$ntp_ok"   != "true" ] && issues="${issues}ntp,"
 
@@ -581,6 +584,69 @@ apply_starlink_config() {
     printf '{"started":true}'
 }
 
+# ── SQM / CAKE / cake-autorate (delegated to /usr/bin/starlink-sqm) ──────────
+
+SQM_INSTALL_LOG="/tmp/starlink-sqm-install.log"
+SQM_INSTALL_PID="/tmp/starlink-sqm-install.pid"
+
+sqm_installing() {
+    [ -f "$SQM_INSTALL_PID" ] && kill -0 "$(cat "$SQM_INSTALL_PID" 2>/dev/null)" 2>/dev/null
+}
+
+sqm_status() {
+    local base installing err
+    if [ ! -x /usr/bin/starlink-sqm ]; then
+        printf '{"available":false}'
+        return
+    fi
+    base=$(/usr/bin/starlink-sqm status 2>/dev/null)
+    sqm_installing && installing=true || installing=false
+    err=""
+    if [ "$installing" = "false" ] && [ -f "$SQM_INSTALL_LOG" ]; then
+        err=$(grep '^ERROR' "$SQM_INSTALL_LOG" | tail -1)
+    fi
+    # splice extra fields into the helper's JSON object
+    printf '%s,"available":true,"installing":%s,"install_error":"%s"}' \
+        "${base%\}}" "$installing" "$(json_str "$err")"
+}
+
+sqm_install() {
+    if [ ! -x /usr/bin/starlink-sqm ]; then
+        printf '{"started":false,"error":"starlink-sqm not found"}'
+        return
+    fi
+    if sqm_installing; then
+        printf '{"started":true}'
+        return
+    fi
+    setsid sh -c 'echo $$ > '"$SQM_INSTALL_PID"'; exec /usr/bin/starlink-sqm install' \
+        </dev/null >"$SQM_INSTALL_LOG" 2>&1 &
+    printf '{"started":true}'
+}
+
+sqm_enable() {
+    local input dl ul autorate out
+    read -r input
+    dl=$(echo "$input" | jsonfilter -e '@.download' 2>/dev/null)
+    ul=$(echo "$input" | jsonfilter -e '@.upload' 2>/dev/null)
+    autorate=$(echo "$input" | jsonfilter -e '@.autorate' 2>/dev/null)
+    case "$dl$ul" in *[!0-9]*|"")
+        printf '{"success":false,"error":"invalid rates"}'
+        return ;;
+    esac
+    case "$autorate" in 1|true) autorate=1 ;; *) autorate=0 ;; esac
+    if out=$(/usr/bin/starlink-sqm enable "$dl" "$ul" "$autorate" 2>&1); then
+        printf '{"success":true}'
+    else
+        printf '{"success":false,"error":"%s"}' "$(json_str "$out")"
+    fi
+}
+
+sqm_disable() {
+    /usr/bin/starlink-sqm disable >/dev/null 2>&1
+    printf '{"success":true}'
+}
+
 # ── dish heater control ───────────────────────────────────────────────────────
 
 set_heater_on() {
@@ -603,7 +669,7 @@ set_heater_off() {
 
 case "$1" in
     list)
-        printf '{"status":{"timeout":20},"dish":{"timeout":15},"reboot_dish":{"timeout":15},"disable_hw_offloading":{"timeout":15},"enable_hw_offloading":{"timeout":15},"starlink_config_status":{"timeout":5},"apply_starlink_config":{"timeout":10},"devices":{"timeout":5},"router_stats":{"timeout":5},"set_home_page":{"timeout":5},"unset_home_page":{"timeout":5},"set_dns_default":{"timeout":15},"set_dns_starlink":{"timeout":15},"set_dns_family":{"timeout":15},"set_dns_malware":{"timeout":15},"set_heater_on":{"timeout":15},"set_heater_off":{"timeout":15},"set_static_ip":{"timeout":10},"remove_static_ip":{"timeout":10}}'
+        printf '{"status":{"timeout":20},"dish":{"timeout":15},"reboot_dish":{"timeout":15},"disable_hw_offloading":{"timeout":15},"enable_hw_offloading":{"timeout":15},"starlink_config_status":{"timeout":5},"apply_starlink_config":{"timeout":10},"devices":{"timeout":5},"router_stats":{"timeout":5},"set_home_page":{"timeout":5},"unset_home_page":{"timeout":5},"set_dns_default":{"timeout":15},"set_dns_starlink":{"timeout":15},"set_dns_family":{"timeout":15},"set_dns_malware":{"timeout":15},"set_heater_on":{"timeout":15},"set_heater_off":{"timeout":15},"set_static_ip":{"timeout":10},"remove_static_ip":{"timeout":10},"sqm_status":{"timeout":10},"sqm_install":{"timeout":5},"sqm_enable":{"timeout":60},"sqm_disable":{"timeout":30}}'
         ;;
     call)
         case "$2" in
@@ -626,6 +692,10 @@ case "$1" in
             set_heater_off)         set_heater_off ;;
             set_static_ip)          set_static_ip ;;
             remove_static_ip)       remove_static_ip ;;
+            sqm_status)             sqm_status ;;
+            sqm_install)            sqm_install ;;
+            sqm_enable)             sqm_enable ;;
+            sqm_disable)            sqm_disable ;;
         esac
         ;;
 esac

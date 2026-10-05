@@ -1,8 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-starlink
-PKG_VERSION:=2.1
-PKG_RELEASE:=5
+PKG_VERSION:=2.2
+PKG_RELEASE:=1
 
 PKG_MAINTAINER:=bigmalloy
 PKG_LICENSE:=MIT
@@ -52,6 +52,8 @@ define Package/luci-app-starlink/install
 		$(1)/usr/bin/starlink-setup
 	$(INSTALL_BIN) ./files/starlink-ipv6-monitor \
 		$(1)/usr/bin/starlink-ipv6-monitor
+	$(INSTALL_BIN) ./files/starlink-sqm \
+		$(1)/usr/bin/starlink-sqm
 endef
 
 define Package/luci-app-starlink/preinst

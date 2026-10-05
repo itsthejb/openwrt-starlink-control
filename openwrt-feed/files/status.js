@@ -95,6 +95,31 @@ var callSetDnsMalware = rpc.declare({
 	expect: {}
 });
 
+var callSqmStatus = rpc.declare({
+	object: 'luci.starlink',
+	method: 'sqm_status',
+	expect: {}
+});
+
+var callSqmInstall = rpc.declare({
+	object: 'luci.starlink',
+	method: 'sqm_install',
+	expect: {}
+});
+
+var callSqmEnable = rpc.declare({
+	object: 'luci.starlink',
+	method: 'sqm_enable',
+	params: ['download', 'upload', 'autorate'],
+	expect: {}
+});
+
+var callSqmDisable = rpc.declare({
+	object: 'luci.starlink',
+	method: 'sqm_disable',
+	expect: {}
+});
+
 var callSetStaticIp = rpc.declare({
 	object: 'luci.starlink',
 	method: 'set_static_ip',
@@ -246,6 +271,7 @@ var CSS = '<style>' +
 '.sl-heater-row{display:flex;align-items:center;justify-content:space-between;margin-top:10px;padding:9px 0;border-top:1px solid var(--sl-stripe);font-size:0.88em;color:var(--sl-text)}' +
 '.sl-heater-chk{width:16px;height:16px;cursor:pointer;accent-color:#2ea043}' +
 '.sl-heater-chk:disabled{cursor:not-allowed;opacity:0.4}' +
+'.sl-sqm-in{width:90px;padding:3px 6px;border:1px solid var(--sl-border);border-radius:4px;background:var(--sl-inset);color:var(--sl-text);font-size:1em;text-align:right}' +
 '.sl-ipv6-warn{background:var(--sl-warn-bg);border:1px solid var(--sl-red);border-left:3px solid var(--sl-red);border-radius:0 4px 4px 0;padding:10px 12px;font-size:0.84em;color:var(--sl-red);margin-bottom:10px}' +
 '.sl-ipv6-warn-title{font-weight:700;margin-bottom:4px}' +
 '.sl-ipv6-warn-body{color:var(--sl-text);line-height:1.5}' +
@@ -672,8 +698,8 @@ function buildRouterStatsCard(rs, s) {
 	var socName = targetNpu[target] || (target ? target + ' NPU' : 'hardware NPU');
 	body += '<div style="font-size:0.78em;color:var(--sl-muted);padding:4px 2px 0">' +
 		(hwOn
-			? '⚠ Hardware offloading active — fq_codel bypassed (' + socName + ' handles routing)'
-			: 'Enable if CPU consistently hits 100% — offloads routing to the ' + socName + '. Disables fq_codel AQM.') +
+			? '⚠ Hardware offloading active — fq_codel/CAKE bypassed (' + socName + ' handles routing)'
+			: 'Enable if CPU consistently hits 100% — offloads routing to the ' + socName + '. Disables fq_codel/CAKE shaping.') +
 		'</div>';
 
 	return card('Router Stats', '⚡', body);
@@ -932,6 +958,79 @@ function buildDNSCard(s) {
 	return card('DNS Servers', '🔒', body);
 }
 
+// ── SQM / CAKE / cake-autorate card ──────────────────────────────────────────
+
+// Edits survive the 10s re-render; null = show the value from the router.
+var _sqmDl = null, _sqmUl = null, _sqmAuto = null;
+var _sqmBusy = '';
+
+function buildSqmCard(q) {
+	q = q || {};
+	if (!q.available) {
+		return card('Traffic Shaping — SQM / CAKE', '🚦',
+			'<div class="sl-note">starlink-sqm helper not found — reinstall luci-app-starlink.</div>');
+	}
+
+	var body = '';
+	var ready = q.installed && q.cake_available && q.autorate_installed;
+
+	if (q.installing) {
+		return card('Traffic Shaping — SQM / CAKE', '🚦',
+			'<div class="sl-note">⟳ Installing sqm-scripts, kmod-sched-cake and cake-autorate… (this can take a minute)</div>');
+	}
+
+	if (!ready) {
+		body += row('SQM (sqm-scripts)',  badge(q.installed ? 'installed' : 'missing', q.installed ? 'ok' : 'warn'));
+		body += row('CAKE (kmod-sched-cake)', badge(q.cake_available ? 'available' : 'missing', q.cake_available ? 'ok' : 'warn'));
+		body += row('cake-autorate',      badge(q.autorate_installed ? 'installed' : 'missing', q.autorate_installed ? 'ok' : 'warn'));
+		if (q.install_error) {
+			body += '<div class="sl-ipv6-warn"><div class="sl-ipv6-warn-body">' + q.install_error + '</div></div>';
+		}
+		body += '<div class="sl-note">CAKE removes bufferbloat on the Starlink link. cake-autorate then adapts the shaper rates to Starlink\u2019s varying capacity. Requires internet access on the router.</div>';
+		body += '<button class="sl-cfg-btn" style="background:var(--sl-inset);border-color:#388bfd;color:#388bfd" onclick="starlinkSqmInstall(this)">Install SQM + CAKE + cake-autorate</button>';
+		return card('Traffic Shaping — SQM / CAKE', '🚦', body);
+	}
+
+	var on   = q.enabled === true;
+	var dl   = _sqmDl   !== null ? _sqmDl   : (q.download || '');
+	var ul   = _sqmUl   !== null ? _sqmUl   : (q.upload   || '');
+	var auto = _sqmAuto !== null ? _sqmAuto : (on ? q.autorate === true : true);
+
+	body += row('Status', badge(on ? 'enabled' : 'disabled', on ? 'ok' : 'muted'));
+	if (on) {
+		body += row('WAN qdisc', badge(q.wan_qdisc || 'unknown', q.wan_qdisc === 'cake' ? 'ok' : 'warn'));
+		body += row('cake-autorate', badge(q.autorate ? (q.autorate_running ? 'running' : 'stopped') : 'off',
+			q.autorate ? (q.autorate_running ? 'ok' : 'warn') : 'muted'));
+		if (q.cur_download || q.cur_upload) {
+			body += row('Current rate', (q.cur_download ? '\u2193 ' + (q.cur_download / 1000).toFixed(1) + ' Mbit/s' : '') +
+				' &nbsp; ' + (q.cur_upload ? '\u2191 ' + (q.cur_upload / 1000).toFixed(1) + ' Mbit/s' : ''));
+		}
+	}
+
+	body += '<div class="sl-heater-row"><span>Max download (kbit/s)</span>' +
+		'<input class="sl-sqm-in" type="number" min="1000" step="1000" id="sl-sqm-dl" value="' + dl + '" oninput="starlinkSqmEdit()"></div>';
+	body += '<div class="sl-heater-row" style="margin-top:0"><span>Max upload (kbit/s)</span>' +
+		'<input class="sl-sqm-in" type="number" min="500" step="500" id="sl-sqm-ul" value="' + ul + '" oninput="starlinkSqmEdit()"></div>';
+	body += '<label class="sl-heater-row" for="sl-sqm-auto" style="margin-top:0;cursor:pointer"><span>Adapt rates with cake-autorate</span>' +
+		'<input type="checkbox" class="sl-heater-chk" id="sl-sqm-auto"' + (auto ? ' checked' : '') + ' onchange="starlinkSqmEdit()"></label>';
+
+	body += '<div style="font-size:0.78em;color:var(--sl-muted);padding:4px 2px 8px">' +
+		'Set rates near what your dish delivers. With autorate they are the ceiling (it tunes between ~10% and this value); without it they are fixed \u2014 use about 85% of measured speed. ' +
+		'Flow offloading is turned off while SQM is on.</div>';
+
+	if (_sqmBusy) {
+		body += '<button class="sl-cfg-btn" disabled style="background:#9a6700;border-color:#d29922;color:#fff">' + _sqmBusy + '</button>';
+	} else {
+		body += '<button class="sl-cfg-btn" style="background:var(--sl-inset);border-color:#388bfd;color:#388bfd" onclick="starlinkSqmApply(this)">' +
+			(on ? 'Apply changes' : 'Enable SQM') + '</button>';
+		if (on) {
+			body += ' <button class="sl-cfg-btn" style="background:var(--sl-inset);border-color:var(--sl-red);color:var(--sl-red)" onclick="starlinkSqmDisable(this)">Disable</button>';
+		}
+	}
+
+	return card('Traffic Shaping — SQM / CAKE', '🚦', body);
+}
+
 function buildConfigCard(s, cs) {
 	var body = '<div class="sl-cfg-grid">';
 
@@ -947,7 +1046,7 @@ function buildConfigCard(s, cs) {
 	var offloadClass = hwOff ? 'warn' : swOff ? 'ok' : 'muted';
 
 	var cfgItems = [
-		['TCP CC',        badge(tcp_cc,    tcp_cc === 'hybla' ? 'ok' : tcp_cc === 'cubic' ? 'warn' : 'info')],
+		['TCP CC',        badge(tcp_cc,    tcp_cc === 'cubic' ? 'ok' : 'info')],
 		['Default qdisc', badge(qdisc,     qdisc === 'fq_codel' && !hwOff ? 'ok' : 'warn')],
 		['MSS clamping',  badge(mtu ? 'enabled' : 'disabled', mtu ? 'ok' : 'warn')],
 		['Offloading',    badge(offloadMode, offloadClass)],
@@ -964,12 +1063,6 @@ function buildConfigCard(s, cs) {
 	if (s.wan_qdisc) {
 		body += '<div class="sl-qdisc">Active qdisc: ' + s.wan_qdisc + '</div>';
 	}
-
-	// Config warnings
-	if (s.tcp_cc && s.tcp_cc !== 'hybla') {
-		body += '<div class="sl-note">ℹ TCP congestion control is <strong>' + s.tcp_cc + '</strong>. For satellite links, hybla is preferred: <code>apk add kmod-tcp-hybla</code></div>';
-	}
-
 
 	// ── Set as default home page button ──────────────────────────────────────
 	var isHome = s.luci_home === '1';
@@ -1118,6 +1211,56 @@ window.starlinkToggleHwOffloading = function(chk) {
 	});
 };
 
+// ── SQM handlers ─────────────────────────────────────────────────────────────
+
+window.starlinkSqmEdit = function() {
+	var dl = document.getElementById('sl-sqm-dl'), ul = document.getElementById('sl-sqm-ul'),
+	    au = document.getElementById('sl-sqm-auto');
+	if (dl) _sqmDl = dl.value;
+	if (ul) _sqmUl = ul.value;
+	if (au) _sqmAuto = au.checked;
+};
+
+window.starlinkSqmInstall = function(btn) {
+	btn.disabled = true;
+	btn.textContent = '\u27f3 Starting\u2026';
+	callSqmInstall().catch(function() { window.alert('RPC error'); });
+};
+
+window.starlinkSqmApply = function(btn) {
+	window.starlinkSqmEdit();
+	var dl = parseInt(_sqmDl, 10), ul = parseInt(_sqmUl, 10);
+	if (!(dl >= 1000) || !(ul >= 500)) {
+		window.alert('Enter valid rates in kbit/s (download \u2265 1000, upload \u2265 500).');
+		return;
+	}
+	_sqmBusy = '\u27f3 Applying\u2026';
+	btn.disabled = true;
+	btn.textContent = _sqmBusy;
+	callSqmEnable(dl, ul, _sqmAuto !== false ? 1 : 0).then(function(r) {
+		_sqmBusy = '';
+		if (r && r.success) { _sqmDl = _sqmUl = _sqmAuto = null; }
+		else window.alert('Failed to enable SQM: ' + ((r && r.error) || 'unknown error'));
+	}).catch(function() {
+		_sqmBusy = '';
+		window.alert('RPC error');
+	});
+};
+
+window.starlinkSqmDisable = function(btn) {
+	if (!window.confirm('Disable SQM / CAKE and cake-autorate?\n\nFlow offloading will be restored to its previous setting.'))
+		return;
+	_sqmBusy = '\u27f3 Disabling\u2026';
+	btn.disabled = true;
+	callSqmDisable().then(function() {
+		_sqmBusy = '';
+		_sqmDl = _sqmUl = _sqmAuto = null;
+	}).catch(function() {
+		_sqmBusy = '';
+		window.alert('RPC error');
+	});
+};
+
 // ── Apply config handler (global so inline onclick can reach it) ─────────────
 
 window.starlinkApplyConfig = function(btn) {
@@ -1189,25 +1332,25 @@ return view.extend({
 	handleReset:     null,
 
 	load: function() {
-		return Promise.all([ callStatus(), callDish(), callStarlinkConfigStatus(), callDevices(), callRouterStats() ]);
+		return Promise.all([ callStatus(), callDish(), callStarlinkConfigStatus(), callDevices(), callRouterStats(), callSqmStatus().catch(function() { return {}; }) ]);
 	},
 
 	render: function(data) {
 		var self = this;
 		var container = E('div');
-		this._updateView(container, data[0] || {}, data[1] || {}, data[2] || {}, data[3] || {}, data[4] || {});
+		this._updateView(container, data[0] || {}, data[1] || {}, data[2] || {}, data[3] || {}, data[4] || {}, data[5] || {});
 
 		poll.add(function() {
-			return Promise.all([ callStatus(), callDish(), callStarlinkConfigStatus(), callDevices(), callRouterStats() ]).then(function(d) {
+			return Promise.all([ callStatus(), callDish(), callStarlinkConfigStatus(), callDevices(), callRouterStats(), callSqmStatus().catch(function() { return {}; }) ]).then(function(d) {
 				var s = d[0] || {};
-				self._updateView(container, s, d[1] || {}, d[2] || {}, d[3] || {}, d[4] || {});
+				self._updateView(container, s, d[1] || {}, d[2] || {}, d[3] || {}, d[4] || {}, d[5] || {});
 			});
 		}, 10);
 
 		return container;
 	},
 
-	_updateView: function(container, s, d, cs, devData, rs) {
+	_updateView: function(container, s, d, cs, devData, rs, sqm) {
 		var dishState = (d && d.available) ? (d.state || 'UNKNOWN') : null;
 		var isConn    = dishState === 'CONNECTED';
 		var now       = new Date().toLocaleTimeString();
@@ -1217,7 +1360,7 @@ return view.extend({
 
 		// Header
 		html += '<div class="sl-header">';
-		html += '<div class="sl-title">🛸 Starlink Control <span style="font-size:0.6em;font-weight:400;color:var(--sl-muted);letter-spacing:.03em">v2.1</span></div>';
+		html += '<div class="sl-title">🛸 Starlink Control <span style="font-size:0.6em;font-weight:400;color:var(--sl-muted);letter-spacing:.03em">v2.2</span></div>';
 		html += '<div class="sl-meta">';
 		if (dishState) {
 			html += badge(dishState, isConn ? 'ok' : 'warn') + ' ';
@@ -1248,6 +1391,7 @@ return view.extend({
 		html += buildRouterStatsCard(rs, s);
 		html += buildDNSCard(s);
 		html += buildConfigCard(s, cs);
+		html += buildSqmCard(sqm);
 		html += buildDevicesCard(devData, s);
 		html += '</div>';
 

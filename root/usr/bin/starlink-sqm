@@ -1,0 +1,270 @@
+#!/bin/sh
+# starlink-sqm — manage SQM (CAKE) and cake-autorate for Starlink.
+#
+# Usage:
+#   starlink-sqm install                        install packages (sqm-scripts, CAKE, cake-autorate)
+#   starlink-sqm enable <dl_kbps> <ul_kbps> [autorate=1|0]
+#   starlink-sqm disable
+#   starlink-sqm status                         JSON status
+#
+# SQM shapes the WAN with CAKE (egress + IFB ingress). cake-autorate then
+# adjusts the CAKE rates between min and max based on measured latency, which
+# suits Starlink's variable capacity. Software/hardware flow offloading bypasses
+# SQM, so it is switched off while SQM is enabled and restored on disable.
+
+OFFLOAD_SAVE=/etc/starlink-sqm.offload
+BEGIN="# --- starlink-sqm ---"
+END="# --- /starlink-sqm ---"
+
+get_wan_dev() {
+    uci -q get network.wan.device 2>/dev/null || echo "eth0"
+}
+
+# SQM names the ingress IFB "ifb4<dev>", truncated to the 15-char ifname limit.
+ifb_name() {
+    printf '%s' "ifb4$1" | cut -c1-15
+}
+
+autorate_dir() {
+    for d in /root/cake-autorate /etc/cake-autorate; do
+        [ -f "$d/config.primary.sh" ] && { echo "$d"; return; }
+    done
+}
+
+autorate_installed() {
+    [ -n "$(autorate_dir)" ] && [ -x /etc/init.d/cake-autorate ]
+}
+
+sqm_installed() {
+    [ -x /etc/init.d/sqm ] && [ -f /etc/config/sqm ]
+}
+
+cake_available() {
+    # kmod-sched-cake provides sch_cake; modprobe succeeds if present.
+    modprobe sch_cake >/dev/null 2>&1 || lsmod 2>/dev/null | grep -q '^sch_cake'
+}
+
+pkg_add() {
+    if command -v apk >/dev/null 2>&1; then
+        apk add "$@" >/dev/null 2>&1
+    else
+        opkg install "$@" >/dev/null 2>&1
+    fi
+}
+
+do_install() {
+    if command -v apk >/dev/null 2>&1; then
+        apk update >/dev/null 2>&1
+    else
+        opkg update >/dev/null 2>&1
+    fi
+
+    echo "Installing sqm-scripts and CAKE..."
+    pkg_add sqm-scripts kmod-sched-cake kmod-ifb tc-full \
+        && echo "  sqm-scripts, kmod-sched-cake installed." \
+        || { echo "ERROR: failed to install sqm-scripts/kmod-sched-cake."; return 1; }
+
+    echo "Installing cake-autorate dependencies (bash, fping)..."
+    pkg_add bash fping \
+        && echo "  bash, fping installed." \
+        || { echo "ERROR: failed to install bash/fping."; return 1; }
+
+    if autorate_installed; then
+        echo "cake-autorate already installed."
+    else
+        echo "Installing cake-autorate..."
+        # Prefer a feed package if one exists; otherwise use the upstream installer.
+        if pkg_add cake-autorate && autorate_installed; then
+            echo "  cake-autorate installed from package feed."
+        else
+            if ! command -v wget >/dev/null 2>&1 && ! command -v uclient-fetch >/dev/null 2>&1; then
+                echo "ERROR: no downloader available for the cake-autorate installer."
+                return 1
+            fi
+            wget -q -O /tmp/cake-autorate_setup.sh \
+                https://raw.githubusercontent.com/lynxthecat/cake-autorate/master/setup.sh \
+                || { echo "ERROR: could not download the cake-autorate installer."; return 1; }
+            yes y | sh /tmp/cake-autorate_setup.sh >/tmp/cake-autorate_setup.log 2>&1
+            rm -f /tmp/cake-autorate_setup.sh
+            autorate_installed \
+                || { echo "ERROR: cake-autorate installer failed (see /tmp/cake-autorate_setup.log)."; return 1; }
+            echo "  cake-autorate installed from upstream."
+        fi
+    fi
+    # Do not let the install leave things running unconfigured.
+    /etc/init.d/cake-autorate stop >/dev/null 2>&1
+    /etc/init.d/cake-autorate disable >/dev/null 2>&1
+    echo "Install complete."
+}
+
+# Replace the managed block at the end of the cake-autorate config.
+write_autorate_config() {
+    local dir wan ifb dl ul dl_min dl_base ul_min ul_base cfg
+    dir=$(autorate_dir); [ -z "$dir" ] && return 1
+    cfg="$dir/config.primary.sh"
+    wan=$(get_wan_dev); ifb=$(ifb_name "$wan")
+    dl=$1; ul=$2
+
+    dl_min=$((dl / 10)); [ "$dl_min" -lt 2000 ] && dl_min=2000
+    ul_min=$((ul / 10)); [ "$ul_min" -lt 1000 ] && ul_min=1000
+    dl_base=$((dl * 6 / 10)); ul_base=$((ul * 6 / 10))
+    [ "$dl_min" -gt "$dl_base" ] && dl_min=$dl_base
+    [ "$ul_min" -gt "$ul_base" ] && ul_min=$ul_base
+
+    [ -f "$cfg.starlink-sqm.bak" ] || cp "$cfg" "$cfg.starlink-sqm.bak"
+    sed -i "\|^$BEGIN\$|,\|^$END\$|d" "$cfg"
+    cat >> "$cfg" << EOF
+$BEGIN
+dl_if=$ifb
+ul_if=$wan
+adjust_dl_shaper_rate=1
+adjust_ul_shaper_rate=1
+min_dl_shaper_rate_kbps=$dl_min
+base_dl_shaper_rate_kbps=$dl_base
+max_dl_shaper_rate_kbps=$dl
+min_ul_shaper_rate_kbps=$ul_min
+base_ul_shaper_rate_kbps=$ul_base
+max_ul_shaper_rate_kbps=$ul
+# The default reflector pool mixes ~20ms, ~60ms and ~180ms hosts (from AU), so
+# cake-autorate rotated one every minute. Use hosts in the same latency band.
+reflectors=(
+"8.8.8.8" "8.8.4.4" "1.0.0.1"
+"208.67.222.222" "208.67.220.220" "208.67.222.123"
+"185.228.168.9" "185.228.168.10" "156.154.70.1" "64.6.64.6"
+)
+$END
+EOF
+}
+
+save_offload() {
+    [ -f "$OFFLOAD_SAVE" ] && return
+    {
+        echo "sw=$(uci -q get firewall.@defaults[0].flow_offloading || echo 0)"
+        echo "hw=$(uci -q get firewall.@defaults[0].flow_offloading_hw || echo 0)"
+    } > "$OFFLOAD_SAVE"
+}
+
+do_enable() {
+    local dl="$1" ul="$2" autorate="${3:-1}" wan
+    case "$dl$ul" in *[!0-9]*|"") echo "ERROR: rates must be integers (kbit/s)."; return 1 ;; esac
+    [ "$dl" -lt 1000 ] || [ "$ul" -lt 500 ] && { echo "ERROR: rates too low."; return 1; }
+
+    sqm_installed || { echo "ERROR: sqm-scripts not installed (run: starlink-sqm install)."; return 1; }
+    cake_available || { echo "ERROR: kmod-sched-cake not available."; return 1; }
+    [ "$autorate" = "1" ] && ! autorate_installed \
+        && { echo "ERROR: cake-autorate not installed (run: starlink-sqm install)."; return 1; }
+
+    wan=$(get_wan_dev)
+
+    # Flow offloading bypasses the qdiscs SQM relies on.
+    save_offload
+    uci set firewall.@defaults[0].flow_offloading='0'
+    uci set firewall.@defaults[0].flow_offloading_hw='0'
+    uci commit firewall
+    service firewall restart >/dev/null 2>&1
+
+    # Replace any default 'eth1' style queue; use a named section for ours.
+    uci -q delete sqm.wan
+    uci set sqm.wan=queue
+    uci set sqm.wan.enabled='1'
+    uci set sqm.wan.interface="$wan"
+    uci set sqm.wan.download="$dl"
+    uci set sqm.wan.upload="$ul"
+    uci set sqm.wan.qdisc='cake'
+    uci set sqm.wan.script='piece_of_cake.qos'
+    uci set sqm.wan.linklayer='ethernet'
+    uci set sqm.wan.overhead='44'
+    uci set sqm.wan.debug_logging='0'
+    uci set sqm.wan.verbosity='5'
+    uci set sqm.wan.qdisc_advanced='1'
+    uci set sqm.wan.squash_dscp='1'
+    uci set sqm.wan.squash_ingress='1'
+    uci set sqm.wan.ingress_ecn='ECN'
+    uci set sqm.wan.egress_ecn='NOECN'
+    uci set sqm.wan.qdisc_really_really_advanced='1'
+    uci set sqm.wan.iqdisc_opts='nat dual-dsthost ingress'
+    uci set sqm.wan.eqdisc_opts='nat dual-srchost ack-filter'
+    uci commit sqm
+
+    /etc/init.d/sqm enable >/dev/null 2>&1
+    /etc/init.d/sqm restart >/dev/null 2>&1
+
+    if [ "$autorate" = "1" ]; then
+        write_autorate_config "$dl" "$ul" || { echo "ERROR: cannot write cake-autorate config."; return 1; }
+        /etc/init.d/cake-autorate enable >/dev/null 2>&1
+        /etc/init.d/cake-autorate restart >/dev/null 2>&1
+    else
+        /etc/init.d/cake-autorate stop >/dev/null 2>&1
+        /etc/init.d/cake-autorate disable >/dev/null 2>&1
+    fi
+    echo "SQM enabled on $wan: down ${dl} kbit/s, up ${ul} kbit/s, autorate=$autorate."
+}
+
+do_disable() {
+    local sw hw
+    if [ -x /etc/init.d/cake-autorate ]; then
+        /etc/init.d/cake-autorate stop >/dev/null 2>&1
+        /etc/init.d/cake-autorate disable >/dev/null 2>&1
+    fi
+    if uci -q get sqm.wan >/dev/null 2>&1; then
+        uci set sqm.wan.enabled='0'
+        uci commit sqm
+    fi
+    if [ -x /etc/init.d/sqm ]; then
+        /etc/init.d/sqm stop >/dev/null 2>&1
+        /etc/init.d/sqm disable >/dev/null 2>&1
+    fi
+
+    # Restore the offloading settings saved when SQM was enabled.
+    if [ -f "$OFFLOAD_SAVE" ]; then
+        sw=$(sed -n 's/^sw=//p' "$OFFLOAD_SAVE")
+        hw=$(sed -n 's/^hw=//p' "$OFFLOAD_SAVE")
+        uci set firewall.@defaults[0].flow_offloading="${sw:-1}"
+        uci set firewall.@defaults[0].flow_offloading_hw="${hw:-0}"
+        uci commit firewall
+        service firewall restart >/dev/null 2>&1
+        rm -f "$OFFLOAD_SAVE"
+    fi
+    echo "SQM disabled."
+}
+
+do_status() {
+    local inst ar_inst cake enabled dl ul autorate running wan qd
+    sqm_installed && inst=true || inst=false
+    autorate_installed && ar_inst=true || ar_inst=false
+    cake_available && cake=true || cake=false
+    [ "$(uci -q get sqm.wan.enabled)" = "1" ] && enabled=true || enabled=false
+    dl=$(uci -q get sqm.wan.download); ul=$(uci -q get sqm.wan.upload)
+    [ -x /etc/init.d/cake-autorate ] && /etc/init.d/cake-autorate enabled 2>/dev/null \
+        && autorate=true || autorate=false
+    if [ -r /var/run/cake-autorate/primary/proc_state ] || pgrep -f cake-autorate.sh >/dev/null 2>&1; then
+        running=true
+    else
+        running=false
+    fi
+    wan=$(get_wan_dev)
+    qd=$(tc qdisc show dev "$wan" 2>/dev/null | head -1 | awk '{print $2}')
+
+    # Current (autorate-adjusted) CAKE rates, in kbit/s.
+    local cur_dl cur_ul
+    cur_ul=$(tc -j qdisc show dev "$wan" 2>/dev/null | jsonfilter -e '@[0].options.bandwidth' 2>/dev/null)
+    cur_dl=$(tc -j qdisc show dev "$(ifb_name "$wan")" 2>/dev/null | jsonfilter -e '@[0].options.bandwidth' 2>/dev/null)
+    # bandwidth is reported in bytes/s
+    [ -n "$cur_ul" ] && cur_ul=$((cur_ul * 8 / 1000))
+    [ -n "$cur_dl" ] && cur_dl=$((cur_dl * 8 / 1000))
+
+    printf '{"installed":%s,"autorate_installed":%s,"cake_available":%s,"enabled":%s,' \
+        "$inst" "$ar_inst" "$cake" "$enabled"
+    printf '"download":"%s","upload":"%s","autorate":%s,"autorate_running":%s,' \
+        "$dl" "$ul" "$autorate" "$running"
+    printf '"cur_download":"%s","cur_upload":"%s","wan_qdisc":"%s"}' \
+        "$cur_dl" "$cur_ul" "$qd"
+}
+
+case "$1" in
+    install) do_install ;;
+    enable)  shift; do_enable "$@" ;;
+    disable) do_disable ;;
+    status)  do_status ;;
+    *) echo "Usage: $0 install | enable <dl_kbps> <ul_kbps> [1|0] | disable | status"; exit 1 ;;
+esac

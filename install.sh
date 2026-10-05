@@ -24,6 +24,7 @@ for f in \
     usr/share/luci/menu.d/luci-app-starlink.json \
     usr/share/rpcd/acl.d/luci-app-starlink.json \
     usr/bin/starlink-setup \
+    usr/bin/starlink-sqm \
     www/luci-static/resources/view/starlink/status.js
 do
     if [ ! -f "${SRC}/${f}" ]; then
@@ -52,6 +53,11 @@ ssh "root@${ROUTER}" "chmod 755 /usr/libexec/rpcd/luci.starlink"
 scp -O "${SRC}/usr/bin/starlink-setup" \
        "root@${ROUTER}:/usr/bin/starlink-setup"
 ssh "root@${ROUTER}" "chmod 755 /usr/bin/starlink-setup"
+
+# SQM / CAKE / cake-autorate helper — must be executable
+scp -O "${SRC}/usr/bin/starlink-sqm" \
+       "root@${ROUTER}:/usr/bin/starlink-sqm"
+ssh "root@${ROUTER}" "chmod 755 /usr/bin/starlink-sqm"
 
 # Menu entry
 scp -O "${SRC}/usr/share/luci/menu.d/luci-app-starlink.json" \
