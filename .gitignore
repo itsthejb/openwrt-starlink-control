@@ -1,3 +1,4 @@
 output/
 *.apk
 CLAUDE.md
+.vscode/settings.json

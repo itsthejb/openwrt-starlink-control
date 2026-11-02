@@ -67,7 +67,7 @@ The setup script from [starlink-openwrt-ipv6-optimized](https://github.com/bigma
 | Requirement | Notes |
 |-------------|-------|
 | OpenWrt 25.x | Uses `apk` package manager; tested on 25.12.0 |
-| Architecture | `aarch64_cortex-a53` (GL-iNet Beryl AX / MT3000) — PKGARCH=all so works anywhere |
+| Architecture | `aarch64_cortex-a53` (GL-iNet Beryl AX / MT3000) — PKGARCH=all so works anywhere, but `starlink-dish` is only downloaded automatically on aarch64 (see [Build on the router](#build-on-the-router-any-architecture-eg-x86_64)) |
 | `luci-base` | LuCI web interface |
 | `rpcd` | RPC daemon (usually pre-installed) |
 | `jsonfilter` | JSON parser for shell scripts |
@@ -140,7 +140,7 @@ chmod +x /usr/bin/starlink-dish
 
 ## Build from Source
 
-Requires Docker.
+Requires a `docker`-compatible CLI (podman works). Scripts can't see a shell alias, so if you use podman make `docker` a real command: `ln -s "$(command -v podman)" /usr/bin/docker`.
 
 ```sh
 git clone https://github.com/bigmalloy/openwrt-starlink-control
@@ -149,7 +149,37 @@ cd openwrt-starlink-control
 # Output: output/luci-app-starlink-*.apk
 ```
 
-The build uses the official `openwrt/sdk:aarch64_cortex-a53-25.12.0-rc5` Docker image.
+The build uses the official `openwrt/sdk:<ARCH>-<OPENWRT_VER>` image, `aarch64_cortex-a53` and `25.12.0-rc5` by default. The package is architecture-independent, so `ARCH` only selects the SDK image. Override it, along with other settings, through environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ARCH` | `aarch64_cortex-a53` | SDK architecture, e.g. `x86-64` |
+| `OPENWRT_VER` | `25.12.0-rc5` | SDK release |
+| `SDK_IMAGE` | `openwrt/sdk:${ARCH}-${OPENWRT_VER}` | Full image reference |
+| `JOBS` | `nproc` | Parallel make jobs |
+| `SIGN_KEY` | unset | PKCS#8 PEM private key; unset leaves the APK unsigned |
+| `PUBLIC_KEY` | `keys/luci-fancontrol-signing.pub` | Public key to verify the signed APK |
+| `OUTPUT_DIR` | `./output` | Where the APK is written |
+
+### Build on the router (any architecture, e.g. x86_64)
+
+Build in the matching SDK image so nothing is emulated, then install the unsigned APK:
+
+```sh
+ARCH=x86-64 ./build-apk-docker.sh
+apk add --allow-untrusted output/luci-app-starlink-*.apk
+```
+
+The SDK image is several GB; keep container storage off the overlay.
+
+`starlink-dish` has no pre-built x86_64 binary, so build it for the host with `build-local-arch.sh` (needs `git` too). It detects the host architecture (x86_64 or aarch64), builds the upstream [starlink-panel](https://github.com/bigmalloy/starlink-panel) source in a musl Rust container, and writes `output/starlink-dish`:
+
+```sh
+./build-local-arch.sh
+install -m 755 output/starlink-dish /usr/bin/starlink-dish
+```
+
+`DISH_REPO`, `DISH_REF`, `SRC_DIR` and `OUTPUT_DIR` override the source repo, branch or tag, checkout location and output directory.
 
 ---
 

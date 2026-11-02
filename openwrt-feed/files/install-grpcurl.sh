@@ -30,6 +30,7 @@ case "$ARCH" in
     aarch64) ;;
     *)
         echo "starlink-dish: pre-built binary only available for aarch64 (this is $ARCH); skipping."
+        echo "Build it for $ARCH and copy it to $DISH_PATH — run ./build-local-arch.sh from the source repo (see the README)."
         exit 0
         ;;
 esac

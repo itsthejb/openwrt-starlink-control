@@ -1,49 +1,64 @@
 #!/bin/bash
 # build-apk-docker.sh
-# Builds luci-app-starlink as a proper OpenWrt 25+ APK using the OpenWrt SDK in Docker.
+# Builds luci-app-starlink as a proper OpenWrt 25+ APK using the OpenWrt SDK in a container.
+# Uses the plain `docker` CLI; podman works via a `docker` symlink (ln -s "$(command -v podman)" /usr/bin/docker).
+#
+# Bumble Confidential. For Internal Use Only.
+#
+# The package is PKGARCH=all, so ARCH only picks which SDK image to build in. Pick the one
+# matching the build host (e.g. x86-64 on an x86_64 router) to avoid emulation.
+#
+# Environment overrides:
+#   ARCH          SDK architecture      (default: aarch64_cortex-a53; e.g. x86-64)
+#   OPENWRT_VER   SDK release           (default: 25.12.0-rc5)
+#   SDK_IMAGE     full image reference  (default: openwrt/sdk:${ARCH}-${OPENWRT_VER})
+#   JOBS          parallel make jobs    (default: nproc)
+#   SIGN_KEY      PKCS#8 PEM private key; unset to leave the APK unsigned
+#   PUBLIC_KEY    public key used to verify the signed APK (default: keys/luci-fancontrol-signing.pub)
+#   OUTPUT_DIR    where the APK lands   (default: ./output)
+#
+# Example (x86_64 router):
+#   ARCH=x86-64 ./build-apk-docker.sh
 
 set -e
 
 PKG="luci-app-starlink"
-OPENWRT_VER="25.12.0-rc5"
-ARCH="aarch64_cortex-a53"
-SDK_IMAGE="openwrt/sdk:${ARCH}-${OPENWRT_VER}"
+OPENWRT_VER="${OPENWRT_VER:-25.12.0-rc5}"
+ARCH="${ARCH:-aarch64_cortex-a53}"
+SDK_IMAGE="${SDK_IMAGE:-openwrt/sdk:${ARCH}-${OPENWRT_VER}}"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/output}"
+PUBLIC_KEY="${PUBLIC_KEY:-${SCRIPT_DIR}/keys/luci-fancontrol-signing.pub}"
+JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
 echo "================================================"
-echo " Building ${PKG} APK for OpenWrt ${OPENWRT_VER}"
-echo " Target: ${ARCH} (GL-iNet Beryl AX / MT3000)"
+echo " Building ${PKG} APK"
+echo " SDK image: ${SDK_IMAGE}"
 echo "================================================"
 echo ""
 
-if ! docker info > /dev/null 2>&1; then
-  echo "ERROR: Docker is not running."
-  exit 1
+mkdir -p "${OUTPUT_DIR}"
+
+SIGN_ARGS=()
+if [ -n "${SIGN_KEY}" ]; then
+  [ -f "${SIGN_KEY}" ] || { echo "ERROR: SIGN_KEY not found at ${SIGN_KEY}"; exit 1; }
+  [ -f "${PUBLIC_KEY}" ] || { echo "ERROR: PUBLIC_KEY not found at ${PUBLIC_KEY}"; exit 1; }
+  SIGN_ARGS=(
+    -v "${SIGN_KEY}:/signing-key/key-build-p8:ro"
+    -v "${PUBLIC_KEY}:/signing-key/signing.pub:ro"
+    -e SIGN=1
+  )
 fi
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-mkdir -p "${SCRIPT_DIR}/output"
-
-# Reuse signing keys from luci-fan project
-KEY_DIR="/home/mike/claude/luci-fan/luci-app-fancontrol/keys"
-PRIVATE_KEY_P8="${KEY_DIR}/luci-fancontrol-signing-p8.pem"
-PUBLIC_KEY="${KEY_DIR}/luci-fancontrol-signing.pub"
-
-if [ ! -f "${PRIVATE_KEY_P8}" ]; then
-  echo "ERROR: Signing key not found at ${PRIVATE_KEY_P8}"
-  exit 1
-fi
-
-HOST_UID="$(id -u)"
-HOST_GID="$(id -g)"
 
 docker run --rm \
   -v "${SCRIPT_DIR}/openwrt-feed:/pkg-src:ro" \
-  -v "${SCRIPT_DIR}/output:/output" \
-  -v "${PRIVATE_KEY_P8}:/signing-key/key-build-p8:ro" \
-  -v "${PUBLIC_KEY}:/signing-key/luci-fancontrol-signing.pub:ro" \
+  -v "${OUTPUT_DIR}:/output" \
+  "${SIGN_ARGS[@]}" \
   --user root \
-  -e HOST_UID="${HOST_UID}" \
-  -e HOST_GID="${HOST_GID}" \
+  -e HOST_UID="$(id -u)" \
+  -e HOST_GID="$(id -g)" \
+  -e JOBS="${JOBS}" \
   "${SDK_IMAGE}" \
   /bin/bash -c '
     set -e
@@ -67,7 +82,7 @@ docker run --rm \
     make defconfig 2>&1 | tail -3
 
     echo "--- Building Lua (required by lucihttp) ---"
-    make package/lua/compile -j4 >/dev/null 2>&1 && echo "lua OK" || echo "WARNING: lua build failed"
+    make package/lua/compile -j"$JOBS" >/dev/null 2>&1 && echo "lua OK" || echo "WARNING: lua build failed"
 
     echo "--- Compiling ---"
     make package/luci-app-starlink/compile V=s 2>&1 | tail -30
@@ -76,30 +91,32 @@ docker run --rm \
     APK=$(find bin/ -name "luci-app-starlink*.apk" -type f | head -1)
     cp "$APK" /output/
     echo "Copied: $APK"
+    OUT=/output/$(basename "$APK")
 
-    echo "--- Signing APK ---"
-    /builder/staging_dir/host/bin/apk --allow-untrusted adbsign \
-      --sign-key /signing-key/key-build-p8 \
-      /output/$(basename "$APK")
+    if [ -n "$SIGN" ]; then
+      echo "--- Signing APK ---"
+      /builder/staging_dir/host/bin/apk --allow-untrusted adbsign \
+        --sign-key /signing-key/key-build-p8 "$OUT"
 
-    echo "--- Verifying ---"
-    /builder/staging_dir/host/bin/apk verify \
-      --keys-dir /signing-key \
-      /output/$(basename "$APK")
+      echo "--- Verifying ---"
+      /builder/staging_dir/host/bin/apk verify --keys-dir /signing-key "$OUT"
+    fi
 
-    chown "${HOST_UID}:${HOST_GID}" /output/$(basename "$APK")
-    ls -lh /output/$(basename "$APK")
+    chown "${HOST_UID}:${HOST_GID}" "$OUT" || true
+    ls -lh "$OUT"
   '
 
 echo ""
 echo "================================================"
-ls -lh "${SCRIPT_DIR}/output/"luci-app-starlink* 2>/dev/null && \
+ls -lh "${OUTPUT_DIR}/"luci-app-starlink* 2>/dev/null && \
   echo "Success!" || echo "No output — check errors above"
 echo "================================================"
 echo ""
-echo "Install on router (signed — needs key in /etc/apk/keys/):"
-echo "  scp -O output/luci-app-starlink-*.apk root@192.168.1.1:/tmp/"
-echo "  ssh root@192.168.1.1 'apk add /tmp/luci-app-starlink-*.apk'"
-echo ""
-echo "Or without key verification:"
-echo "  ssh root@192.168.1.1 'apk add --allow-untrusted /tmp/luci-app-starlink-*.apk'"
+if [ -n "${SIGN_KEY}" ]; then
+  echo "Install on router (signed — needs the public key in /etc/apk/keys/):"
+  echo "  apk add ${OUTPUT_DIR}/luci-app-starlink-*.apk"
+  echo ""
+fi
+echo "Install without key verification:"
+echo "  apk add --allow-untrusted ${OUTPUT_DIR}/luci-app-starlink-*.apk"
+echo "(or scp -O it to root@192.168.1.1:/tmp/ first when building off-router)"
